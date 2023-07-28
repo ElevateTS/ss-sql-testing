@@ -1,0 +1,271 @@
+CREATE PROCEDURE [dbo].[usp_ComplianceReportAllMonthsNAperiodEmployees]
+	@custId int,
+    @Year int,
+	@lastMonth int
+AS
+BEGIN
+SET NOCOUNT ON;
+DECLARE @nvhAddDays int=0;
+DECLARE @nvhAddMonths int=0;
+if object_id(N'tempdb..#histMOnths') is not null begin drop table #histMOnths end;
+create table #histMOnths
+(
+EmployeeId varchar(50),
+NVHStartDate date,
+FullTimeStatus VARCHAR(100),
+hireDate date,
+isFromMM bit DEFAULT 0
+)
+SELECT @nvhAddDays=ISNULL(NewHourlyEmpl_AdminPeriod,0) ,@nvhAddMonths=ISNULL(NewHourlyEmpl_MeasurementPeriod,0) FROM DashboardCustomerSetups WITH(NOLOCK) WHERE ID=@custId;
+DECLARE @firstOfYear date =CONVERT(DATE,convert(varchar(2),1) +'/1/'+convert(varchar(4),@Year))
+DECLARE @lastOfYear date =CONVERT(DATE,convert(varchar(2),12) +'/31/'+convert(varchar(4),@Year))
+
+if object_id(N'tempdb..#returnTable') is not null begin drop table #returnTable end;
+create table #returnTable
+(
+MonthNumber int,
+EmployeeId varchar(50)
+)
+
+--if object_id(N'tempdb..#FPLROP') is not null begin drop table #FPLROP end;
+--create table #FPLROP
+--(
+--MonthNumber int,
+--EmployeeId varchar(50),
+--FPL bit,
+--ROP_CALCULATED bit,
+--ROP_UPLOADED bit
+--)
+DECLARE @ISMM bit;
+SELECT  @ISMM=ISNULL(MonthlyMeasurement, 0) FROM CUSTOMERS WITH(NOLOCK) WHERE ID=@custId
+--INSERT INTO #FPLROP
+--SELECT * from [dbo].[GetFPLandROPFor1095DraftViewForAllMonths](@custId,@Year,@lastMonth)
+
+declare @CurrentMonth int=1;
+WHILE @CurrentMonth<=@lastMonth
+  BEGIN
+  DECLARE @firstOfMonth date =CONVERT(DATE,convert(varchar(2),@CurrentMonth) +'/1/'+convert(varchar(4),@Year))
+  DECLARE @lastOfMonth date = DATEADD(day,-1,DATEADD(month,1,@firstOfMonth))
+
+
+if object_id(N'tempdb..#historyPreviousMonth') is not null begin drop table #historyPreviousMonth end;
+create table #historyPreviousMonth
+(
+EmployeeId varchar(50),
+MeasurementMonth int,
+EmployeeType varchar(50)
+)
+if object_id(N'tempdb..#historyThisMonth') is not null begin drop table #historyThisMonth end;
+create table #historyThisMonth
+(
+EmployeeId varchar(50),
+MeasurementMonth int,
+EmployeeType varchar(50)
+)
+
+if object_id(N'tempdb..#historyThisMonthBackUp') is not null begin drop table #historyThisMonthBackUp end;
+create table #historyThisMonthBackUp
+(
+EmployeeId varchar(50),
+MeasurementMonth int,
+EmployeeType varchar(50)
+)
+
+
+INSERT INTO #historyThisMonth
+SELECT EmployeeId,MeasurementMonth,EmployeeType
+FROM MeasuredEmployeesMonthlyHistory with(nolock) WHERE ID=@CUSTID and EmployeeType='Full Time' 
+and MeasurementMonth=@CurrentMonth and MeasurementYear=@Year and LastPeriod=0
+AND EmployeeId NOT IN(SELECT EmployeeId FROM MeasuredEmployeesMonthlyHistory C with(nolock)    
+  WHERE C.ID=@CUSTID
+ and MeasurementMonth=@CurrentMonth and MeasurementYear=@Year
+ and (
+				--(C.LastPeriod=0 and C.FullTimeStatus='Designated Full-Time') 
+				 (C.LastPeriod=1 and C.FullTimeStatus='Calculated Full-Time')
+				or (@ISMM = 1 and C.LastPeriod = 0 and
+                         C.FullTimeStatus = 'Calculated Full-Time')
+				)	
+);
+
+
+INSERT INTO #historyPreviousMonth
+SELECT EmployeeId,MeasurementMonth,EmployeeType FROM(
+SELECT M.EmployeeId,M.MeasurementMonth,M.EmployeeType,ROW_NUMBER() OVER(PARTITION BY M.Id, M.EmployeeId ORDER BY M.MeasurementMonth DESC) rn
+FROM MeasuredEmployeesMonthlyHistory  M with(nolock)
+INNER JOIN #historyThisMonth MM on M.Id=@custId and M.EmployeeId=MM.EmployeeId and M.EmployeeType!=MM.EmployeeType
+WHERE M.ID=@CUSTID  and M.MeasurementMonth < @CurrentMonth and M.MeasurementYear=@Year and LastPeriod=0)
+a WHERE rn=1;
+
+--SYN 416
+INSERT INTO #historyPreviousMonth
+SELECT H.EmployeeId,Month(H.PayPeriodEndDate),H.EmployeeType FROM [dbo].[GetLastEmployeeRecordBeforeCutoff](@CustId,DATEADD(day,-1,DATEADD(month,1,CONVERT(DATE,convert(varchar(2),CASE WHEN @CurrentMonth=1 then 1 else @CurrentMonth-1 end) +'/1/'+convert(varchar(4),@Year))))) H
+LEFT JOIN #historyPreviousMonth HP on H.ID=@custId and H.EmployeeId=HP.EmployeeId
+INNER JOIN #historyThisMonth MM on H.Id=@custId and H.EmployeeId=MM.EmployeeId and H.EmployeeType!=MM.EmployeeType
+WHERE HP.EmployeeId IS NULL;
+
+INSERT INTO #historyThisMonthBackUp SELECT * FROM #historyThisMonth;
+DELETE FROM #historyThisMonth;
+
+INSERT INTO #historyThisMonth
+SELECT * FROM #historyPreviousMonth 
+WHERE EMPLOYEEID NOT In(
+SELECT B.EMPLOYEEID FROM BACoverageOffers B with(nolock)
+INNER JOIN BAPlanInfos BP with(nolock) on B.CompanyId=BP.CompanyId and B.PlanName=BP.PlanName and B.PlanRenewalDate=BP.PlanRenewalDate
+LEFT JOIN (select * from GetCalculatedHireTermDates(@CustId,@lastOfMonth)) A1 on A1.CustomerId=B.CompanyId and A1.EmployeeId=B.EmployeeId
+where B.CompanyId=@custId and BP.MeetsMinCoverageRequirements =1
+and ((BP.PlanEndDate = '1/1/900' and  BP.PlanRenewalDate >= @firstOfYear) OR BP.PlanRenewalDate >= @firstOfYear OR BP.PlanEndDate >= @firstOfYear)
+AND BP.PlanRenewalDate <= @lastOfYear and BP.PlanEndDate >= @firstOfYear
+and (CASE WHEN B.EnrollmentDate != '1/1/1900' AND B.EnrollmentDate < B.DateOfOffer THEN B.EnrollmentDate ELSE B.DateOfOffer END <= @firstOfMonth)
+ --SYN 447
+--and (B.DisenrollmentDate = '1/1/1900'  OR  B.DisenrollmentDate >= @lastOfMonth) 
+and (isnull(A1.TerminationDate,'1/1/1900')='1/1/1900' or isnull(A1.TerminationDate,'1/1/1900') >= @firstOfMonth)
+--END SYN 447AND (BP.PlanEndDate = '1/1/1900' OR BP.PlanEndDate >= @lastOfMonth)
+AND(B.DisenrollmentDate = null OR B.DisenrollmentDate = '1/1/1900' OR B.DisenrollmentDate >= @lastOfMonth)
+)
+
+ INSERT INTO #histMOnths
+SELECT EMPLOYEEID,NVHDate,FTStatus,PayPeriodEndDate,0
+ FROM(SELECT A.EMPLOYEEID,'1/1/1900' as NVHDate,'' AS FTStatus,A.PayPeriodEndDate,ROW_NUmber() over (partition by A.Id,A.EmployeeId ORDER by A.PayPeriodEndDate DESC) rn
+ FROM EmployeeHours A with(nolock)
+ inner JOIN #historyThisMonth B ON A.ID=@custId and A.EmployeeId=B.EmployeeId
+ WHERE A.Id=@custId and A.PayPeriodEndDate <=
+ DATEADD(d, -1, DATEADD(m, DATEDIFF(m, 0,  
+ CONVERT(DATE,convert(varchar(2),(SELECT TOP 1 ISNULL(MeasurementMonth,1) FROM MeasuredEmployeesMonthlyHistory G with(nolock) WHERE Id=@custid and G.EmployeeId=A.EmployeeId
+ and MeasurementMonth > B.MeasurementMonth and MeasurementYear=@Year and LastPeriod=1)) +'/1/'+convert(varchar(4),@Year))
+ ) + 1, 0))) a WHERE rn=1
+
+
+  --SYN-442
+ INSERT INTO #histMOnths
+SELECT EMPLOYEEID,NVHDate,FTStatus,PayPeriodEndDate,0
+ FROM(SELECT A.EMPLOYEEID,'1/1/1900' as NVHDate,'' AS FTStatus,A.PayPeriodEndDate,ROW_NUmber() 
+ over (partition by A.Id,A.EmployeeId ORDER by A.PayPeriodEndDate DESC) rn
+ FROM EmployeeHours A with(nolock)
+ INNER JOIN #historyThisMonthBackUp MM on A.Id=@custId and A.EmployeeId=MM.EmployeeId and A.EmployeeType!=MM.EmployeeType
+ left JOIN #histMOnths B ON A.ID=@custId and A.EmployeeId=B.EmployeeId 
+ WHERE A.Id=@custId and A.PayPeriodEndDate <=@firstOfMonth AND  B.EmployeeId IS NULL
+ ) a WHERE rn=1
+
+
+INSERT INTO #histMOnths
+SELECT EmployeeId,NVHStartDate,FullTimeStatus,hireDate,0
+FROM (
+SELECT EmployeeId,NVHStartDate,FullTimeStatus,hireDate,ROW_NUMBER() OVER(PARTITION BY d.Id,d.EmployeeId,d.MeasurementYear,d.MeasurementMonth ORDER BY d.EmployeeId DESC) rn
+FROM MeasuredEmployeesMonthlyHistory d with(nolock) WHERE 
+d.Id=@custId and d.MeasurementYear=@Year and d.MeasurementMonth=@CurrentMonth and @ISMM=0
+ AND ((d.LastPeriod =1 AND d.Category != 'Designated Full-Time' AND d.Category != 'Monthly')
+ OR (d.LastPeriod = 0 AND (d.Category = 'Designated Full-Time' OR d.Category = 'Monthly')))
+)a
+WHERE rn=1
+
+IF @ISMM=0
+BEGIN
+INSERT INTO #histMOnths
+SELECT EmployeeId,NVHStartDate,FullTimeStatus,hireDate,0
+FROM (
+SELECT d.EmployeeId,d.NVHStartDate,d.FullTimeStatus,d.hireDate,ROW_NUMBER() OVER(PARTITION BY d.Id, d.EmployeeId,d.MeasurementYear,d.MeasurementMonth ORDER BY d.LastPeriod DESC) rn
+FROM MeasuredEmployeesMonthlyHistory d with(nolock)
+LEFT JOIN #histMOnths H On d.Id=@custId and d.EmployeeId=H.EmployeeId
+WHERE d.Id=@custId and d.MeasurementYear=@Year and d.MeasurementMonth=@CurrentMonth AND H.EmployeeId is NULL
+)a
+WHERE rn=1
+END
+ELSE 
+BEGIN
+INSERT INTO #histMOnths
+SELECT EmployeeId,NVHStartDate,FullTimeStatus,hireDate,1
+FROM (
+SELECT d.EmployeeId,d.NVHStartDate,d.FullTimeStatus,d.hireDate,ROW_NUMBER() OVER(PARTITION BY d.Id, d.EmployeeId ORDER BY d.NVHStartDate) rn
+FROM MeasuredEmployeesMonthlyHistory d with(nolock)
+LEFT JOIN #histMOnths H On d.Id=@custId and d.EmployeeId=H.EmployeeId
+WHERE d.Id=@custId AND H.EmployeeId is NULL
+and d.FullTimeStatus='Calculated Full-Time'
+)a
+WHERE rn=1
+END
+
+
+--SYN 378
+IF EXISTS (SELECT NULL FROM CUSTOMERS WITH(NOLOCK) WHERE ID=@CustId AND REONLY=1)
+BEGIN
+INSERT INTO #histMOnths
+SELECT EmployeeId,'1/1/1900','Designated Full Time',max(effectiveDate),0
+from BAEmployeeCensus with(nolock) where companyId=@CustId
+and effectiveDate <= @lastOfMonth
+group by companyId,EmployeeId
+END 
+
+--SYN-391
+INSERT INTO #histMOnths
+SELECT EmployeeId,
+NVHStartDate,
+FullTimeStatus,
+hireDate ,0
+FROM(
+select EmployeeId,'1/1/1900' AS NVHStartDate,'Calculated Full-Time' as FullTimeStatus, CASE WHEN @lastOfMonth between A.AdminStart and A.StabilEnd and
+A.FullTimeStatus='Calculated Full-Time' 
+and Not EXISTS(SELECT NULL FROM MeasurementDataArchive B WITH(NOLOCK) WHERE A.Id=B.Id ANd A.EmployeeId=B.EmployeeId and 
+B.MeasurementStart < A.MeasurementStart and  (FullTimeStatus='Calculated Full-Time' OR FullTimeStatus='Designated Full-Time'))
+THEN ISNULL(A.MeasurementEnd,'1/1/1900') ELSE '1/1/1900' END as hireDate,ROW_NUMBER() OVER(PARTITION BY Id,EmployeeId ORDER BY AdminStart desc) rn
+from MeasurementDataArchive A WITH(NOLOCK) WHERE A.ID=@CustId) a
+where rn=1 and hireDate!='1/1/1900'
+
+
+INSERT INTO #returnTable
+SELECT @CurrentMonth, EmployeeId FROM #histMOnths
+WHERE (( 
+
+                          CASE WHEN @ISMM=0 AND isFromMM=0 AND
+						  DAY(dateadd(day, 90, DATEADD(DAY,-1,DATEADD(MONTH,@nvhAddMonths,ISNULL(NVHStartDate,'1/1/1900'))))) =1
+						  THEN dateadd(day, 90, DATEADD(DAY,-1,DATEADD(MONTH,@nvhAddMonths,ISNULL(NVHStartDate,'1/1/1900'))))
+						  ELSE 
+						  DATEADD(month, DATEDIFF(month, 0,DATEADD(day,-1,DATEADD(MONTH,1,dateadd(day, 90, DATEADD(DAY,-1,DATEADD(MONTH,@nvhAddMonths,ISNULL(NVHStartDate,'1/1/1900'))))))), 0)
+						  END >@lastOfMonth
+						  AND LOWER(REPLACE(FullTimeStatus,'-',' '))!='designated full time'
+						  AND FullTimeStatus!='Monthly'
+)
+OR
+( 
+
+                          CASE WHEN @ISMM=1 AND isFromMM=1 AND
+						  DAY(dateadd(day, 90, DATEADD(DAY,-1,DATEADD(MONTH,0,ISNULL(NVHStartDate,'1/1/1900'))))) =1
+						  THEN dateadd(day, 90, DATEADD(DAY,-1,DATEADD(MONTH,0,ISNULL(NVHStartDate,'1/1/1900'))))
+						  ELSE 
+						  DATEADD(month, DATEDIFF(month, 0,DATEADD(day,-1,DATEADD(MONTH,1,dateadd(day, 90, DATEADD(DAY,-1,DATEADD(MONTH,0,ISNULL(NVHStartDate,'1/1/1900'))))))), 0)
+						  END >@lastOfMonth						 
+)
+OR 
+						CASE WHEN 
+						  DAY(dateadd(day, 90, hireDate)) =1 THEN dateadd(day, 90, hireDate)
+						  ELSE 
+						  DATEADD(month, DATEDIFF(month, 0,DATEADD(day,-1,DATEADD(MONTH,1,dateadd(day, 90, hireDate)))), 0)
+						  END
+						  >= @lastOfMonth
+
+
+) AND EmployeeId NOT IN(SELECT F.EmployeeId from  MeasurementDataArchive F WITH(NOLOCK) 	
+	inner join [dbo].[GetLastEmployeeRecordBeforeCutoff](@CustId,@lastOfMonth) C On F.Id=C.Id and F.EmployeeId=C.EmployeeId
+	WHERE F.Id=@CustId
+	 AND (isnull(C.TerminationDate,'1/1/1900')='1/1/1900' or isnull(C.TerminationDate,'1/1/1900') >= @lastOfMonth)
+       and @lastOfMonth between StabilStart and StabilEnd and REPLACE(LOWER(LTRIM(RTRIM(FullTimeStatus))),'-',' ')='calculated full time'
+      group by F.Id,F.EmployeeId)--SYN-250
+UNION ALL
+select @CurrentMonth,EmployeeId from MeasurementDataArchive A with(nolock) WHERE A.ID=@custId
+and  
+@lastOfMonth between A.AdminStart and A.AdminEnd
+and A.FullTimeStatus='Calculated Full-Time'
+and Not EXISTS(SELECT NULL FROM MeasurementDataArchive B WITH(NOLOCK) WHERE A.Id=B.Id
+ANd A.EmployeeId=B.EmployeeId and B.MeasurementStart < A.MeasurementStart
+and  (FullTimeStatus='Calculated Full-Time' OR FullTimeStatus='Designated Full-Time')
+)
+  SET @CurrentMonth=@CurrentMonth +1;
+  END
+ 
+ SELECT * from #returnTable;
+
+
+END
+go
+
+-- Write a create view statement for the above stored procedure
+EXEC sp_executesql N'CREATE VIEW [dbo].[GetEmployeesWithMeasurementMonth] AS SELECT * FROM [dbo].[GetEmployeesWithMeasurementMonth]();'
